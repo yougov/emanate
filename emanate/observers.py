@@ -1,5 +1,6 @@
 """Classes for observers in ``emanate``."""
 import logging
+import time
 from threading import Thread
 
 from six.moves import queue
@@ -60,8 +61,11 @@ class RabbitMQPublisher(QueuePublisher):
     By default, messages are published on a headers exchange. The name of the
     exchange is given in the `config` passed to the Publisher's constructor.
 
+    If the 'incessant' flag is set, then the publisher will continuously attempt
+    to try and publish an event regardless of any errors - no new events will be
+    processed until the current event has been successfully published.
     """
-    def __init__(self, config, broker_name='default'):
+    def __init__(self, config, broker_name='default', incessant=True):
         self.config = config
         self.broker_name = broker_name
         self.broker = broker_from_config(
@@ -69,6 +73,7 @@ class RabbitMQPublisher(QueuePublisher):
         )
         self.publisher = BlockingJSONPublisher(self.broker)
         self.exchange = self.config['rabbitmq']['default_exchange']
+        self.incessant = incessant
         self._initialize()
         super(RabbitMQPublisher, self).__init__()
 
@@ -100,21 +105,36 @@ class RabbitMQPublisher(QueuePublisher):
             self._handle_event(event)
 
     def _handle_event(self, event):
+        is_retry = False
         try:
-            self._process_event(event)
+            while True:
+                published = self._process_event(event, is_retry=is_retry)
+                if self.incessant and not published:
+                    log.info('Will attempt to republish event.')
+                    time.sleep(0.2) # Wait briefly before trying again.
+                    is_retry = True
+                    continue
+                return
         except Exception as exc:
             log.exception(exc)
         finally:
             self._queue.task_done()
 
-    def _process_event(self, event):
+    def _process_event(self, event, is_retry=False):
+        '''Returns true if the event was published, false otherwise.'''
         properties = Properties()
         if event.context:
             properties.headers = event.context
 
         try:
             self.publisher.publish(self.exchange, '', event.data, properties)
+            return True
         except (AMQPError, RecursionError) as exc:
-            log.exception('Cannot publish to RabbitMQ: %r', exc)
-            log.warn('Failed to publish message payload %s with context %s',
-                     event.data, event.context)
+            # To stop us generate too many logs when repeatedly retrying to
+            # publish an event, we only produce a full log on the initial
+            # attempt.
+            if not is_retry:
+                log.exception('Cannot publish to RabbitMQ: %r', exc)
+                log.warn('Failed to publish message payload %s with context %s',
+                         event.data, event.context)
+            return False
